@@ -323,13 +323,140 @@ def draw_boxes(img, bbox, names, object_id, identities=None, offset=(0, 0), fram
     
     return img
 
+class ImagePreprocessor:
+    """
+    Class to preprocess images before detection to improve results on blurry or noisy inputs.
+    Includes multiple enhancement methods that can be enabled or disabled as needed.
+    """
+    def __init__(self, 
+                 denoise=True, 
+                 sharpen=True, 
+                 enhance_contrast=True, 
+                 clahe=False,
+                 bilateral_filter=False,
+                 denoise_strength=10,
+                 sharpen_strength=0.5,
+                 contrast_limit=3.0):
+        """
+        Initialize the image preprocessor with options for different enhancement techniques.
+        
+        Args:
+            denoise (bool): Apply denoising
+            sharpen (bool): Apply sharpening
+            enhance_contrast (bool): Apply contrast enhancement
+            clahe (bool): Apply Contrast Limited Adaptive Histogram Equalization
+            bilateral_filter (bool): Apply bilateral filtering (preserves edges)
+            denoise_strength (int): Strength of denoising (higher = stronger)
+            sharpen_strength (float): Strength of sharpening (0.0-1.0)
+            contrast_limit (float): Limit for contrast adjustment in CLAHE
+        """
+        self.denoise = denoise
+        self.sharpen = sharpen
+        self.enhance_contrast = enhance_contrast
+        self.clahe = clahe
+        self.bilateral_filter = bilateral_filter
+        self.denoise_strength = denoise_strength
+        self.sharpen_strength = sharpen_strength
+        self.contrast_limit = contrast_limit
+        
+        # Initialize CLAHE if needed
+        if self.clahe:
+            self.clahe_obj = cv2.createCLAHE(clipLimit=contrast_limit, tileGridSize=(8, 8))
+            
+    def apply_denoising(self, image):
+        """Apply non-local means denoising to reduce noise"""
+        return cv2.fastNlMeansDenoisingColored(
+            image, 
+            None, 
+            h=self.denoise_strength, 
+            hColor=self.denoise_strength, 
+            templateWindowSize=7, 
+            searchWindowSize=21
+        )
+    
+    def apply_sharpening(self, image):
+        """Apply unsharp mask filter to sharpen the image"""
+        blurred = cv2.GaussianBlur(image, (0, 0), 3)
+        return cv2.addWeighted(
+            image, 
+            1.0 + self.sharpen_strength, 
+            blurred, 
+            -self.sharpen_strength, 
+            0
+        )
+    
+    def apply_contrast_enhancement(self, image):
+        """Enhance contrast using histogram equalization"""
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        if self.clahe:
+            # Apply CLAHE to L channel
+            l = self.clahe_obj.apply(l)
+        else:
+            # Simple histogram equalization
+            l = cv2.equalizeHist(l)
+            
+        # Merge channels
+        lab = cv2.merge((l, a, b))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    def apply_bilateral_filter(self, image):
+        """Apply bilateral filter to reduce noise while preserving edges"""
+        return cv2.bilateralFilter(image, 9, 75, 75)
+    
+    def process(self, image):
+        """
+        Apply selected preprocessing steps to the image
+        
+        Args:
+            image: Input image in BGR format (OpenCV standard)
+            
+        Returns:
+            Processed image
+        """
+        # Make a copy to avoid modifying the original
+        processed = image.copy()
+        
+        # Apply bilateral filter (edge-preserving smoothing)
+        if self.bilateral_filter:
+            processed = self.apply_bilateral_filter(processed)
+            
+        # Apply denoising
+        if self.denoise:
+            processed = self.apply_denoising(processed)
+            
+        # Apply contrast enhancement
+        if self.enhance_contrast:
+            processed = self.apply_contrast_enhancement(processed)
+            
+        # Apply sharpening (last to avoid amplifying noise)
+        if self.sharpen:
+            processed = self.apply_sharpening(processed)
+            
+        return processed
 
 class DetectionPredictor(BasePredictor):
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        # Initialize the image preprocessor with default settings
+        self.image_preprocessor = ImagePreprocessor(
+            denoise=True,
+            sharpen=True, 
+            enhance_contrast=True,
+            clahe=True,
+            bilateral_filter=False,
+            denoise_strength=10,
+            sharpen_strength=0.3,
+            contrast_limit=2.0
+        )
 
     def get_annotator(self, img):
         return Annotator(img, line_width=self.args.line_thickness, example=str(self.model.names))
 
     def preprocess(self, img):
+        # Convert to tensor and normalize for the model
         img = torch.from_numpy(img).to(self.model.device)
         img = img.half() if self.model.fp16 else img.float()  # uint8 to fp16/32
         img /= 255  # 0 - 255 to 0.0 - 1.0
@@ -356,6 +483,10 @@ class DetectionPredictor(BasePredictor):
             im = im[None]  # expand for batch dim
         self.seen += 1
         im0 = im0.copy()
+        
+        # Apply image preprocessing to improve detection quality
+        # im0 = self.image_preprocessor.process(im0)
+        
         if self.webcam:  # batch_size >= 1
             log_string += f'{idx}: '
             frame = self.dataset.count
